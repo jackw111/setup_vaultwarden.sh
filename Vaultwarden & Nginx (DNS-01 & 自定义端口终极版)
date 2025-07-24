@@ -1,0 +1,240 @@
+#!/bin/bash
+
+# ==============================================================================
+# Vaultwarden & Nginx (DNS-01 & 自定义端口终极版)
+#
+# 使用 Certbot 的 DNS-01 (Cloudflare) 插件申请SSL证书，完全不依赖80/443端口。
+# 允许用户完全自定义 Nginx 监听的端口。
+# ==============================================================================
+
+# --- 配置颜色输出 ---
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# --- 函数定义 ---
+
+# 检查脚本是否以 root 权限运行
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}错误: 请使用 sudo 或以 root 用户身份运行此脚本。${NC}"
+        exit 1
+    fi
+}
+
+# 检查命令是否成功执行
+check_success() {
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误: 上一步操作失败，脚本已终止。请检查输出信息。${NC}"
+        exit 1
+    fi
+}
+
+# 检查端口是否被占用 (除了Nginx自身)
+check_port() {
+    local port=$1
+    if ss -tlnp | grep -q ":${port} "; then
+        echo -e "${RED}错误: 端口 ${port} 已被占用，请更换端口或停止占用该端口的程序。${NC}"
+        exit 1
+    fi
+}
+
+# 安装系统依赖
+install_dependencies() {
+    echo -e "${GREEN}>>> 1. 正在更新系统并安装依赖...${NC}"
+    apt-get update
+    check_success
+    # 【修改】安装 certbot 的 cloudflare dns 插件
+    apt-get install -y docker.io docker-compose nginx python3-certbot-dns-cloudflare curl openssl
+    check_success
+    systemctl enable --now docker && systemctl enable --now nginx
+    check_success
+    echo -e "${GREEN}>>> 依赖安装完成。${NC}"
+}
+
+# 获取用户输入
+get_user_input() {
+    echo -e "${GREEN}>>> 2. 请输入配置信息...${NC}"
+    while [ -z "$DOMAIN_NAME" ]; do
+        read -p "请输入你的域名 (确保DNS由Cloudflare管理): " DOMAIN_NAME
+    done
+    while [ -z "$EMAIL" ]; do
+        read -p "请输入你的邮箱 (用于 Let's Encrypt 证书提醒): " EMAIL
+    done
+    while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
+        # 【修改】获取 Cloudflare API Token
+        read -p "请输入你的 Cloudflare API Token (具有DNS编辑权限): " CLOUDFLARE_API_TOKEN
+    done
+    
+    # 询问自定义端口
+    read -p "请输入你希望用于HTTP访问的端口 (例如 8081, 将重定向到HTTPS): " HTTP_PORT
+    HTTP_PORT=${HTTP_PORT:-8081}
+    
+    read -p "请输入你希望用于HTTPS访问的端口 (例如 8443): " HTTPS_PORT
+    HTTPS_PORT=${HTTPS_PORT:-8443}
+
+    check_port $HTTP_PORT
+    check_port $HTTPS_PORT
+}
+
+# 设置并启动 Vaultwarden
+setup_vaultwarden() {
+    echo -e "${GREEN}>>> 3. 正在配置并启动 Vaultwarden 容器...${NC}"
+    
+    mkdir -p /opt/vaultwarden
+    cd /opt/vaultwarden
+
+    ADMIN_TOKEN=$(openssl rand -base64 48)
+
+    cat <<EOF > docker-compose.yml
+version: '3'
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: always
+    ports:
+      - "127.0.0.1:8080:80"
+      - "127.0.0.1:3012:3012"
+    environment:
+      - WEBSOCKET_ENABLED=true
+      - ADMIN_TOKEN=\${ADMIN_TOKEN}
+    volumes:
+      - ./vw-data:/data
+EOF
+    check_success
+
+    echo -e "${YELLOW}--> 正在创建 .env 文件以安全地存储管理员令牌...${NC}"
+    cat <<EOF > .env
+ADMIN_TOKEN=${ADMIN_TOKEN}
+EOF
+    check_success
+    
+    chmod 600 .env
+
+    docker-compose up -d --force-recreate
+    check_success
+
+    echo -e "${YELLOW}等待 10 秒钟，确保 Vaultwarden 服务完全启动...${NC}"
+    sleep 10
+    echo -e "${GREEN}>>> Vaultwarden 容器已成功启动。${NC}"
+}
+
+# 配置 Nginx 和 SSL (使用 DNS-01 模式)
+setup_nginx_ssl() {
+    echo -e "${GREEN}>>> 4. 正在配置 Nginx 并使用 DNS-01 方式申请 SSL 证书...${NC}"
+
+    # 【修改】创建Cloudflare凭证文件
+    echo -e "${YELLOW}--> 步骤 4.1: 创建 Cloudflare 凭证文件...${NC}"
+    mkdir -p /etc/letsencrypt/cloudflare
+    cat <<EOF > /etc/letsencrypt/cloudflare/cloudflare.ini
+dns_cloudflare_api_token = ${CLOUDFLARE_API_TOKEN}
+EOF
+    chmod 600 /etc/letsencrypt/cloudflare/cloudflare.ini
+    check_success
+
+    # 【修改】使用 certbot 的 dns-01 方式申请证书
+    echo -e "${YELLOW}--> 步骤 4.2: 使用 Certbot (dns-cloudflare插件) 申请 SSL 证书...${NC}"
+    echo -e "${YELLOW}这可能需要一两分钟，因为需要等待DNS记录全球生效...${NC}"
+    certbot certonly \
+      --dns-cloudflare \
+      --dns-cloudflare-credentials /etc/letsencrypt/cloudflare/cloudflare.ini \
+      -d "${DOMAIN_NAME}" \
+      --agree-tos \
+      --email "${EMAIL}" \
+      --non-interactive
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误: SSL证书申请失败！${NC}"
+        echo -e "${RED}请检查: 1. 你的域名DNS是否由Cloudflare管理。 2. API Token是否正确且有权限。 3. 域名是否输入正确。${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}--> 步骤 4.3: 配置最终的 Nginx 站点 (使用你自定义的端口)...${NC}"
+    cat <<EOF > /etc/nginx/sites-available/vaultwarden.conf
+# HTTP请求将被重定向到HTTPS的自定义端口
+server {
+    listen ${HTTP_PORT};
+    server_name ${DOMAIN_NAME};
+    location / {
+        return 301 https://\$host:${HTTPS_PORT}\$request_uri;
+    }
+}
+
+# 主要的HTTPS服务监听在你的自定义端口上
+server {
+    listen ${HTTPS_PORT} ssl http2;
+    server_name ${DOMAIN_NAME};
+
+    # SSL 证书路径
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
+    
+    # SSL 安全配置
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+
+    # 反向代理到 Vaultwarden
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # 反向代理到 WebSocket 服务
+    location /notifications/hub {
+        proxy_pass http://127.0.0.1:3012;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+    check_success
+
+    # 删除默认配置并启用新配置
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sfn /etc/nginx/sites-available/vaultwarden.conf /etc/nginx/sites-enabled/
+    
+    # 检查并重载 Nginx
+    nginx -t && systemctl reload nginx
+    check_success
+    echo -e "${GREEN}>>> Nginx 和 SSL 配置完成。Vaultwarden现在监听在端口 ${HTTP_PORT}(http) 和 ${HTTPS_PORT}(https)。${NC}"
+}
+
+# 显示最终信息
+show_final_info() {
+    echo -e "===================================================================="
+    echo -e "${GREEN}🎉 恭喜！Vaultwarden 部署完成！(DNS-01 模式) 🎉${NC}"
+    echo -e "===================================================================="
+    echo -e "${YELLOW}你的 Vaultwarden 访问地址是:${NC} https://${DOMAIN_NAME}:${HTTPS_PORT}"
+    echo ""
+    echo -e "${YELLOW}你的管理员后台访问令牌 (Admin Token) 已保存在文件 /opt/vaultwarden/.env 中。${NC}"
+    echo -e "请使用以下命令查看："
+    echo -e "  ${GREEN}sudo cat /opt/vaultwarden/.env${NC}"
+    echo ""
+    echo -e "${RED}重要提示:${NC}"
+    echo -e "1. 80和443端口未被占用，你可以用于其他服务。"
+    echo -e "2. SSL证书将通过DNS方式自动续订，无需人工干预。"
+    echo -e "3. 请确保你的防火墙已放行你自定义的端口: ${GREEN}${HTTP_PORT}${NC} 和 ${GREEN}${HTTPS_PORT}${NC}"
+    echo -e "  - 如果使用 UFW, 请运行: sudo ufw allow ${HTTP_PORT} && sudo ufw allow ${HTTPS_PORT}"
+    echo -e "4. 定期备份 /opt/vaultwarden/vw-data 目录！"
+    echo -e "===================================================================="
+}
+
+# --- 主函数 ---
+main() {
+    check_root
+    install_dependencies
+    get_user_input
+    setup_vaultwarden
+    setup_nginx_ssl
+    show_final_info
+}
+
+# --- 执行脚本 ---
+main
