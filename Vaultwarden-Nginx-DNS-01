@@ -3,6 +3,10 @@
 # ==============================================================================
 # Vaultwarden & Nginx (DNS-01 & 自定义端口终极版 - Snap Certbot)
 #
+# v2.0 更新:
+# - 【新】增加服务器时间强制同步功能。
+# - 【新】Nginx 配置增加 IP 访问拦截，提升安全性。
+#
 # 使用 Snap 安装最新版 Certbot 以解决版本兼容性问题。
 # 使用 Certbot 的 DNS-01 (Cloudflare) 插件申请SSL证书。
 # ==============================================================================
@@ -40,65 +44,66 @@ check_port() {
     fi
 }
 
-# 【全新】安装 Certbot (Snap 方式)
+# 【新功能】校准服务器时间
+sync_system_time() {
+    echo -e "${GREEN}>>> 正在校准服务器时间...${NC}"
+    # 使用 timedatectl，这是现代 systemd 系统的标准方式
+    if command -v timedatectl &> /dev/null; then
+        timedatectl set-ntp true
+        check_success
+        echo -e "${YELLOW}--> 已启用并触发网络时间同步 (NTP)。${NC}"
+        sleep 2 # 等待同步操作生效
+        echo -e "${YELLOW}--> 当前服务器时间: $(date)${NC}"
+    else
+        echo -e "${YELLOW}警告: 未找到 timedatectl 命令。对于非 systemd 系统，请手动配置 NTP。${NC}"
+    fi
+}
+
+# 安装 Certbot (Snap 方式)
 install_certbot_snap() {
     echo -e "${GREEN}>>> 正在使用 Snap 安装最新版的 Certbot...${NC}"
-
-    # 1. 确保 snapd 已安装并运行
     if ! command -v snap &> /dev/null; then
         echo -e "${YELLOW}--> Snapd 未安装，正在安装...${NC}"
         apt-get update
         apt-get install -y snapd
         check_success
     fi
-    # 某些系统(如Debian)需要多一步来启用snap通信
     if [ ! -S /run/snapd.socket ]; then
       systemctl enable --now snapd.socket
     fi
-    sleep 5 # 等待snapd服务完全启动
-
-    # 2. 卸载通过 apt 安装的旧版 Certbot，避免冲突
+    sleep 5
     echo -e "${YELLOW}--> 正在卸载旧的 apt/yum 版本 Certbot (如有)...${NC}"
     apt-get remove -y certbot python3-certbot-dns-cloudflare
-    # yum remove certbot # 如果是CentOS/RHEL
-
-    # 3. 通过 Snap 安装 Certbot
     echo -e "${YELLOW}--> 正在通过 Snap 安装 Certbot 核心程序...${NC}"
     snap install core && snap refresh core
     snap install --classic certbot
     check_success
-
-    # 4. 创建符号链接，让 certbot 命令全局可用
     echo -e "${YELLOW}--> 正在创建 certbot 命令的符号链接...${NC}"
     ln -sfn /snap/bin/certbot /usr/bin/certbot
-
-    # 5. 通过 Snap 安装 Cloudflare DNS 插件
     echo -e "${YELLOW}--> 正在通过 Snap 安装 Certbot 的 Cloudflare DNS 插件...${NC}"
     snap set certbot trust-plugin-with-root=ok
     snap install certbot-dns-cloudflare
     check_success
-
     echo -e "${GREEN}>>> Certbot (Snap) 安装和配置完成。${NC}"
 }
 
-
-# 安装系统依赖 (移除 certbot 相关)
+# 安装系统依赖
 install_dependencies() {
     echo -e "${GREEN}>>> 1. 正在更新系统并安装依赖...${NC}"
     apt-get update
     check_success
+    
+    # 【新功能调用】首先同步时间
+    sync_system_time
+
     apt-get install -y docker.io docker-compose nginx curl openssl
     check_success
     systemctl enable --now docker && systemctl enable --now nginx
     check_success
-
-    # 调用新的 Certbot 安装函数
     install_certbot_snap
-
     echo -e "${GREEN}>>> 依赖安装完成。${NC}"
 }
 
-# ... (后面的 get_user_input, setup_vaultwarden 函数保持不变) ...
 get_user_input() {
     echo -e "${GREEN}>>> 2. 请输入配置信息...${NC}"
     while [ -z "$DOMAIN_NAME" ]; do
@@ -110,28 +115,21 @@ get_user_input() {
     while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
         read -p "请输入你的 Cloudflare API Token (具有DNS编辑权限): " CLOUDFLARE_API_TOKEN
     done
-    
     read -p "请输入你希望用于HTTP访问的端口 (例如 8081, 将重定向到HTTPS) [8081]: " HTTP_PORT
     HTTP_PORT=${HTTP_PORT:-8081}
-    
     read -p "请输入你希望用于HTTPS访问的端口 (例如 8443) [8443]: " HTTPS_PORT
     HTTPS_PORT=${HTTPS_PORT:-8443}
-
     check_port $HTTP_PORT
     check_port $HTTPS_PORT
 }
 
 setup_vaultwarden() {
     echo -e "${GREEN}>>> 3. 正在配置并启动 Vaultwarden 容器...${NC}"
-    
     mkdir -p /opt/vaultwarden
     cd /opt/vaultwarden
-
     ADMIN_TOKEN=$(openssl rand -base64 48)
-
     cat <<EOF > docker-compose.yml
 version: '3'
-
 services:
   vaultwarden:
     image: vaultwarden/server:latest
@@ -147,37 +145,29 @@ services:
       - ./vw-data:/data
 EOF
     check_success
-
     echo -e "${YELLOW}--> 正在创建 .env 文件以安全地存储管理员令牌...${NC}"
     cat <<EOF > .env
 ADMIN_TOKEN=${ADMIN_TOKEN}
 EOF
     check_success
-    
     chmod 600 .env
-
     docker-compose up -d --force-recreate
     check_success
-
     echo -e "${YELLOW}等待 10 秒钟，确保 Vaultwarden 服务完全启动...${NC}"
     sleep 10
     echo -e "${GREEN}>>> Vaultwarden 容器已成功启动。${NC}"
 }
 
-# 配置 Nginx 和 SSL (几乎不变，只是命令路径更可靠)
+# 配置 Nginx 和 SSL
 setup_nginx_ssl() {
     echo -e "${GREEN}>>> 4. 正在配置 Nginx 并使用 DNS-01 方式申请 SSL 证书...${NC}"
-
     echo -e "${YELLOW}--> 步骤 4.1: 创建 Cloudflare 凭证文件...${NC}"
     mkdir -p /etc/letsencrypt/cloudflare
-    # 【注意】这里使用了 -n 和 echo -e 来防止API Token中的特殊字符导致问题
     echo -n "dns_cloudflare_api_token = ${CLOUDFLARE_API_TOKEN}" > /etc/letsencrypt/cloudflare/cloudflare.ini
     chmod 600 /etc/letsencrypt/cloudflare/cloudflare.ini
     check_success
-
     echo -e "${YELLOW}--> 步骤 4.2: 使用 Certbot (dns-cloudflare插件) 申请 SSL 证书...${NC}"
     echo -e "${YELLOW}这可能需要一两分钟，因为需要等待DNS记录全球生效...${NC}"
-    # 【修改】Certbot 命令本身没变，但现在它是由 Snap 提供的最新版本
     certbot certonly \
       --dns-cloudflare \
       --dns-cloudflare-credentials /etc/letsencrypt/cloudflare/cloudflare.ini \
@@ -192,24 +182,53 @@ setup_nginx_ssl() {
         exit 1
     fi
 
-    echo -e "${YELLOW}--> 步骤 4.3: 配置最终的 Nginx 站点 (使用你自定义的端口)...${NC}"
+    echo -e "${YELLOW}--> 步骤 4.3: 配置最终的 Nginx 站点 (包含IP访问拦截)...${NC}"
+    # 【修改】下面的 Nginx 配置增加了第一个 server 块，用于拦截 IP 访问
     cat <<EOF > /etc/nginx/sites-available/vaultwarden.conf
+# ----------------------------------------------------------
+# 【新】拦截所有通过 IP 地址对 ${HTTPS_PORT} 端口的 HTTPS 访问
+# ----------------------------------------------------------
+server {
+    listen ${HTTPS_PORT} ssl http2 default_server;
+    listen [::]:${HTTPS_PORT} ssl http2 default_server;
+
+    # server_name _ 捕获所有未匹配到其他 server_name 的请求
+    server_name _;
+
+    # 必须提供证书才能在 SSL 模式下监听，我们借用主域名的证书
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
+
+    # 返回 444，Nginx会直接关闭连接，不给攻击者任何响应
+    return 444;
+}
+
+# ----------------------------------------------------------
+# HTTP -> HTTPS 重定向块 (8081 -> 8443)
+# ----------------------------------------------------------
 server {
     listen ${HTTP_PORT};
     server_name ${DOMAIN_NAME};
     location / {
+        # 注意 Nginx 变量前的反斜杠，防止 shell 提前解析
         return 301 https://\$host:${HTTPS_PORT}\$request_uri;
     }
 }
+
+# ----------------------------------------------------------
+# Vaultwarden 的主服务块
+# ----------------------------------------------------------
 server {
     listen ${HTTPS_PORT} ssl http2;
     server_name ${DOMAIN_NAME};
+
     ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
@@ -217,6 +236,7 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+
     location /notifications/hub {
         proxy_pass http://127.0.0.1:3012;
         proxy_set_header Upgrade \$http_upgrade;
@@ -234,7 +254,6 @@ EOF
     echo -e "${GREEN}>>> Nginx 和 SSL 配置完成。Vaultwarden现在监听在端口 ${HTTP_PORT}(http) 和 ${HTTPS_PORT}(https)。${NC}"
 }
 
-# ... (show_final_info 和 main 函数保持不变) ...
 show_final_info() {
     echo -e "===================================================================="
     echo -e "${GREEN}🎉 恭喜！Vaultwarden 部署完成！(DNS-01 & Snap Certbot) 🎉${NC}"
@@ -251,6 +270,7 @@ show_final_info() {
     echo -e "3. 请确保你的防火墙已放行你自定义的端口: ${GREEN}${HTTP_PORT}${NC} 和 ${GREEN}${HTTPS_PORT}${NC}"
     echo -e "  - 如果使用 UFW, 请运行: sudo ufw allow ${HTTP_PORT} && sudo ufw allow ${HTTPS_PORT}"
     echo -e "4. 定期备份 /opt/vaultwarden/vw-data 目录！"
+    echo -e "5. Nginx 已配置为拒绝通过 IP 地址直接访问，提升安全性。"
     echo -e "===================================================================="
 }
 
