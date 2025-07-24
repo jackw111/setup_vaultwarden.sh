@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# Vaultwarden & Nginx (DNS-01 & 自定义端口终极版)
+# Vaultwarden & Nginx (DNS-01 & 自定义端口终极版 - Snap Certbot)
 #
-# 使用 Certbot 的 DNS-01 (Cloudflare) 插件申请SSL证书，完全不依赖80/443端口。
-# 允许用户完全自定义 Nginx 监听的端口。
+# 使用 Snap 安装最新版 Certbot 以解决版本兼容性问题。
+# 使用 Certbot 的 DNS-01 (Cloudflare) 插件申请SSL证书。
 # ==============================================================================
 
 # --- 配置颜色输出 ---
@@ -40,20 +40,65 @@ check_port() {
     fi
 }
 
-# 安装系统依赖
+# 【全新】安装 Certbot (Snap 方式)
+install_certbot_snap() {
+    echo -e "${GREEN}>>> 正在使用 Snap 安装最新版的 Certbot...${NC}"
+
+    # 1. 确保 snapd 已安装并运行
+    if ! command -v snap &> /dev/null; then
+        echo -e "${YELLOW}--> Snapd 未安装，正在安装...${NC}"
+        apt-get update
+        apt-get install -y snapd
+        check_success
+    fi
+    # 某些系统(如Debian)需要多一步来启用snap通信
+    if [ ! -S /run/snapd.socket ]; then
+      systemctl enable --now snapd.socket
+    fi
+    sleep 5 # 等待snapd服务完全启动
+
+    # 2. 卸载通过 apt 安装的旧版 Certbot，避免冲突
+    echo -e "${YELLOW}--> 正在卸载旧的 apt/yum 版本 Certbot (如有)...${NC}"
+    apt-get remove -y certbot python3-certbot-dns-cloudflare
+    # yum remove certbot # 如果是CentOS/RHEL
+
+    # 3. 通过 Snap 安装 Certbot
+    echo -e "${YELLOW}--> 正在通过 Snap 安装 Certbot 核心程序...${NC}"
+    snap install core && snap refresh core
+    snap install --classic certbot
+    check_success
+
+    # 4. 创建符号链接，让 certbot 命令全局可用
+    echo -e "${YELLOW}--> 正在创建 certbot 命令的符号链接...${NC}"
+    ln -sfn /snap/bin/certbot /usr/bin/certbot
+
+    # 5. 通过 Snap 安装 Cloudflare DNS 插件
+    echo -e "${YELLOW}--> 正在通过 Snap 安装 Certbot 的 Cloudflare DNS 插件...${NC}"
+    snap set certbot trust-plugin-with-root=ok
+    snap install certbot-dns-cloudflare
+    check_success
+
+    echo -e "${GREEN}>>> Certbot (Snap) 安装和配置完成。${NC}"
+}
+
+
+# 安装系统依赖 (移除 certbot 相关)
 install_dependencies() {
     echo -e "${GREEN}>>> 1. 正在更新系统并安装依赖...${NC}"
     apt-get update
     check_success
-    # 【修改】安装 certbot 的 cloudflare dns 插件
-    apt-get install -y docker.io docker-compose nginx python3-certbot-dns-cloudflare curl openssl
+    apt-get install -y docker.io docker-compose nginx curl openssl
     check_success
     systemctl enable --now docker && systemctl enable --now nginx
     check_success
+
+    # 调用新的 Certbot 安装函数
+    install_certbot_snap
+
     echo -e "${GREEN}>>> 依赖安装完成。${NC}"
 }
 
-# 获取用户输入
+# ... (后面的 get_user_input, setup_vaultwarden 函数保持不变) ...
 get_user_input() {
     echo -e "${GREEN}>>> 2. 请输入配置信息...${NC}"
     while [ -z "$DOMAIN_NAME" ]; do
@@ -63,22 +108,19 @@ get_user_input() {
         read -p "请输入你的邮箱 (用于 Let's Encrypt 证书提醒): " EMAIL
     done
     while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
-        # 【修改】获取 Cloudflare API Token
         read -p "请输入你的 Cloudflare API Token (具有DNS编辑权限): " CLOUDFLARE_API_TOKEN
     done
     
-    # 询问自定义端口
-    read -p "请输入你希望用于HTTP访问的端口 (例如 8081, 将重定向到HTTPS): " HTTP_PORT
+    read -p "请输入你希望用于HTTP访问的端口 (例如 8081, 将重定向到HTTPS) [8081]: " HTTP_PORT
     HTTP_PORT=${HTTP_PORT:-8081}
     
-    read -p "请输入你希望用于HTTPS访问的端口 (例如 8443): " HTTPS_PORT
+    read -p "请输入你希望用于HTTPS访问的端口 (例如 8443) [8443]: " HTTPS_PORT
     HTTPS_PORT=${HTTPS_PORT:-8443}
 
     check_port $HTTP_PORT
     check_port $HTTPS_PORT
 }
 
-# 设置并启动 Vaultwarden
 setup_vaultwarden() {
     echo -e "${GREEN}>>> 3. 正在配置并启动 Vaultwarden 容器...${NC}"
     
@@ -122,22 +164,20 @@ EOF
     echo -e "${GREEN}>>> Vaultwarden 容器已成功启动。${NC}"
 }
 
-# 配置 Nginx 和 SSL (使用 DNS-01 模式)
+# 配置 Nginx 和 SSL (几乎不变，只是命令路径更可靠)
 setup_nginx_ssl() {
     echo -e "${GREEN}>>> 4. 正在配置 Nginx 并使用 DNS-01 方式申请 SSL 证书...${NC}"
 
-    # 【修改】创建Cloudflare凭证文件
     echo -e "${YELLOW}--> 步骤 4.1: 创建 Cloudflare 凭证文件...${NC}"
     mkdir -p /etc/letsencrypt/cloudflare
-    cat <<EOF > /etc/letsencrypt/cloudflare/cloudflare.ini
-dns_cloudflare_api_token = ${CLOUDFLARE_API_TOKEN}
-EOF
+    # 【注意】这里使用了 -n 和 echo -e 来防止API Token中的特殊字符导致问题
+    echo -n "dns_cloudflare_api_token = ${CLOUDFLARE_API_TOKEN}" > /etc/letsencrypt/cloudflare/cloudflare.ini
     chmod 600 /etc/letsencrypt/cloudflare/cloudflare.ini
     check_success
 
-    # 【修改】使用 certbot 的 dns-01 方式申请证书
     echo -e "${YELLOW}--> 步骤 4.2: 使用 Certbot (dns-cloudflare插件) 申请 SSL 证书...${NC}"
     echo -e "${YELLOW}这可能需要一两分钟，因为需要等待DNS记录全球生效...${NC}"
+    # 【修改】Certbot 命令本身没变，但现在它是由 Snap 提供的最新版本
     certbot certonly \
       --dns-cloudflare \
       --dns-cloudflare-credentials /etc/letsencrypt/cloudflare/cloudflare.ini \
@@ -148,12 +188,12 @@ EOF
     if [ $? -ne 0 ]; then
         echo -e "${RED}错误: SSL证书申请失败！${NC}"
         echo -e "${RED}请检查: 1. 你的域名DNS是否由Cloudflare管理。 2. API Token是否正确且有权限。 3. 域名是否输入正确。${NC}"
+        echo -e "${RED}同时请查看日志文件 /var/log/letsencrypt/letsencrypt.log 获取详细错误信息。${NC}"
         exit 1
     fi
 
     echo -e "${YELLOW}--> 步骤 4.3: 配置最终的 Nginx 站点 (使用你自定义的端口)...${NC}"
     cat <<EOF > /etc/nginx/sites-available/vaultwarden.conf
-# HTTP请求将被重定向到HTTPS的自定义端口
 server {
     listen ${HTTP_PORT};
     server_name ${DOMAIN_NAME};
@@ -161,23 +201,15 @@ server {
         return 301 https://\$host:${HTTPS_PORT}\$request_uri;
     }
 }
-
-# 主要的HTTPS服务监听在你的自定义端口上
 server {
     listen ${HTTPS_PORT} ssl http2;
     server_name ${DOMAIN_NAME};
-
-    # SSL 证书路径
     ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
-    
-    # SSL 安全配置
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
-
-    # 反向代理到 Vaultwarden
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
@@ -185,8 +217,6 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
-
-    # 反向代理到 WebSocket 服务
     location /notifications/hub {
         proxy_pass http://127.0.0.1:3012;
         proxy_set_header Upgrade \$http_upgrade;
@@ -196,20 +226,18 @@ server {
 EOF
     check_success
 
-    # 删除默认配置并启用新配置
     rm -f /etc/nginx/sites-enabled/default
     ln -sfn /etc/nginx/sites-available/vaultwarden.conf /etc/nginx/sites-enabled/
     
-    # 检查并重载 Nginx
     nginx -t && systemctl reload nginx
     check_success
     echo -e "${GREEN}>>> Nginx 和 SSL 配置完成。Vaultwarden现在监听在端口 ${HTTP_PORT}(http) 和 ${HTTPS_PORT}(https)。${NC}"
 }
 
-# 显示最终信息
+# ... (show_final_info 和 main 函数保持不变) ...
 show_final_info() {
     echo -e "===================================================================="
-    echo -e "${GREEN}🎉 恭喜！Vaultwarden 部署完成！(DNS-01 模式) 🎉${NC}"
+    echo -e "${GREEN}🎉 恭喜！Vaultwarden 部署完成！(DNS-01 & Snap Certbot) 🎉${NC}"
     echo -e "===================================================================="
     echo -e "${YELLOW}你的 Vaultwarden 访问地址是:${NC} https://${DOMAIN_NAME}:${HTTPS_PORT}"
     echo ""
@@ -226,7 +254,6 @@ show_final_info() {
     echo -e "===================================================================="
 }
 
-# --- 主函数 ---
 main() {
     check_root
     install_dependencies
